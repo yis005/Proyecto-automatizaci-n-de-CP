@@ -21,25 +21,25 @@ def extraer_datos_pdf(pdf_path, debug=False):
             if texto:
                 texto_completo += texto + "\n"
 
-            # Extraer palabras con coordenadas
+            # Extraer palabras especificas
             words = page.extract_words()
 
-            # Buscar etiquetas "52." en esta página
+            # Buscar casillas "52." en esta página
             etiquetas_52 = [w for w in words if "52." in w["text"]]
 
-            # Para cada etiqueta, buscar el número asociado (misma columna, debajo)
+            # buscar el número de abajo de cada etiqueta
             for etq in etiquetas_52:
                 for cand in words:
-                    # Misma columna con tolerancia, debajo de la etiqueta
+                    # Misma columna debajo de la etiqueta
                     if (cand["top"] > etq["top"] and
                         abs(cand["x0"] - etq["x0"]) < 15 and
                         re.match(r'^[\d.]+$', cand["text"])):
-                        # Evitar agregar la propia etiqueta "52." como valor
+                        # no suma el 52.
                         if cand["text"] != "52.":
                             valores_52.append(cand["text"])
-                        break  # Solo el primer número después de la etiqueta
+                        break  
 
-            # Buscar número de formulario (priorizar 0006...)
+            # Buscar el numero de codigo de barras (aún no me funciona)
             for w in words:
                 if re.match(r'^0006\d+', w["text"]):
                     formulario = w["text"]
@@ -47,13 +47,13 @@ def extraer_datos_pdf(pdf_path, debug=False):
                 elif re.match(r'^\d{14}$', w["text"]) and not formulario:
                     formulario = w["text"]
 
-        # Si no se encontraron valores por coordenadas, intentar con regex
+        # Si no se encontraron valores por palabras especificas, intentar con regex
         if not valores_52:
             # Patrón más flexible: "52. Valor total" seguido de un número con decimales
             patron = r'52\.\s*Valor\s*total.*?(\d+\.\d+)'
             valores_52 = re.findall(patron, texto_completo, re.IGNORECASE | re.DOTALL)
 
-        # Buscar factura en todo el texto
+        # Buscar la palabra factura en todo el PDF
         match_factura = re.search(r'CM-\d+', texto_completo)
         if match_factura:
             factura = match_factura.group(0)
@@ -61,7 +61,7 @@ def extraer_datos_pdf(pdf_path, debug=False):
     if not factura:
         factura = os.path.splitext(os.path.basename(pdf_path))[0]
 
-    # Depuración opcional
+    # Depurar
     if debug:
         print("\n--- TEXTO EXTRAÍDO (primeros 2000 caracteres) ---")
         print(texto_completo[:2000])
@@ -81,11 +81,11 @@ def procesar_pdfs(base_dir="C:/Users/LENOVO/OneDrive/Desktop/CP",
                 try:
                     factura, valores, formulario = extraer_datos_pdf(pdf_path, debug=debug)
 
-                    # Sumar los valores numéricos, ignorando los que no son válidos
+                    # Sumar los valores numéricos, menos el 52.
                     suma_total = 0.0
                     valores_limpios = []
                     for v in valores:
-                        # Eliminar cualquier texto que no sea número (como "52.")
+                        # Eliminar cualquier texto que no sea número (52.)
                         if re.match(r'^\d+\.\d+$', v):  # Asegura formato decimal
                             try:
                                 suma_total += float(v)
@@ -107,10 +107,10 @@ def procesar_pdfs(base_dir="C:/Users/LENOVO/OneDrive/Desktop/CP",
                 except Exception as e:
                     print(f"❌ Error en {file}: {e}")
 
-    # Crear DataFrame y guardar
+    # Crear Datos y guardar
     df = pd.DataFrame(resultados)
-    # Opcional: eliminar columna de depuración si no la quieres en el Excel
-    # df.drop(columns=["Valores Encontrados"], inplace=True)
+    # quitar la columna de resultados en el excel, no es necesaria, solo la tengo para ver los resultados en el script
+    df.drop(columns=["Valores Encontrados"], inplace=True)
     df.to_excel(salida, index=False)
     print(f"\n📁 Archivo Excel generado: {salida}")
 
