@@ -1,54 +1,118 @@
 import os
+import re
 import pdfplumber
 import pandas as pd
-import re
-from collections import defaultdict
 
-#Ojo aquí está la ruta de las carpetas a recorrer
-def procesar_pdfs(base_dir="C:\Users\LENOVO\OneDrive\Desktop\CP", salida="resultado.xlsx"):
-    resultados = defaultdict(lambda: {"total": 0.0, "formulario": None, "codigo_barras": None})
+def extraer_datos_pdf(pdf_path, debug=False):
+    """
+    Extrae del PDF:
+        - Número de factura (patrón CM- seguido de dígitos)
+        - Lista de valores del campo 52 (valor total de cada ítem)
+        - Número de formulario (prioriza 0006..., luego 14 dígitos)
+    """
+    factura = None
+    valores_52 = []
+    formulario = None
+    texto_completo = ""
 
-#Recorrer carpetas y subcarpetas 
+    with pdfplumber.open(pdf_path) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            texto = page.extract_text()
+            if texto:
+                texto_completo += texto + "\n"
+
+            # Extraer palabras con coordenadas
+            words = page.extract_words()
+
+            # Buscar etiquetas "52." en esta página
+            etiquetas_52 = [w for w in words if "52." in w["text"]]
+
+            # Para cada etiqueta, buscar el número asociado (misma columna, debajo)
+            for etq in etiquetas_52:
+                for cand in words:
+                    # Misma columna con tolerancia, debajo de la etiqueta
+                    if (cand["top"] > etq["top"] and
+                        abs(cand["x0"] - etq["x0"]) < 15 and
+                        re.match(r'^[\d.]+$', cand["text"])):
+                        # Evitar agregar la propia etiqueta "52." como valor
+                        if cand["text"] != "52.":
+                            valores_52.append(cand["text"])
+                        break  # Solo el primer número después de la etiqueta
+
+            # Buscar número de formulario (priorizar 0006...)
+            for w in words:
+                if re.match(r'^0006\d+', w["text"]):
+                    formulario = w["text"]
+                    break
+                elif re.match(r'^\d{14}$', w["text"]) and not formulario:
+                    formulario = w["text"]
+
+        # Si no se encontraron valores por coordenadas, intentar con regex
+        if not valores_52:
+            # Patrón más flexible: "52. Valor total" seguido de un número con decimales
+            patron = r'52\.\s*Valor\s*total.*?(\d+\.\d+)'
+            valores_52 = re.findall(patron, texto_completo, re.IGNORECASE | re.DOTALL)
+
+        # Buscar factura en todo el texto
+        match_factura = re.search(r'CM-\d+', texto_completo)
+        if match_factura:
+            factura = match_factura.group(0)
+
+    if not factura:
+        factura = os.path.splitext(os.path.basename(pdf_path))[0]
+
+    # Depuración opcional
+    if debug:
+        print("\n--- TEXTO EXTRAÍDO (primeros 2000 caracteres) ---")
+        print(texto_completo[:2000])
+        print("----------------------")
+
+    return factura, valores_52, formulario
+
+def procesar_pdfs(base_dir="C:/Users/LENOVO/OneDrive/Desktop/CP",
+                  salida="C:/Users/LENOVO/OneDrive/Desktop/CP/resultado.xlsx",
+                  debug=True):
+    resultados = []
+
     for root, dirs, files in os.walk(base_dir):
         for file in files:
-            if file.endswith(".pdf"): #ojo con esto nos aseguramos que solo recorra archivos .PDF
-                pdf_path = os.path.join(root, file) #Ojo esto es para obtener la ruta completa de los archivos
-                with pdfplumber.open(pdf_path) as pdf:
-                    text = ""
-                    for page in pdf.pages:
-                        text += page.extract_text() or ""
-                    
-                    # Extraer número de formulario
-                    formulario = re.search(r"Número de formulario.*?(\d+)", text)
-                    # Extraer código de barras (secuencia larga de dígitos)
-                    codigo_barras = re.search(r"\b\d{15,}\b", text)
+            if file.lower().endswith(".pdf"):
+                pdf_path = os.path.join(root, file)
+                try:
+                    factura, valores, formulario = extraer_datos_pdf(pdf_path, debug=debug)
 
-                    facturas = re.findall(r"40\. No\. Factura\s*\n?[A-Za-z\-]*([0-9]+)", text)
-                    valores = re.findall(r"52\. Valor total\s*\n?([\d,.]+)", text) # Buscar facturas y valores
-                   
+                    # Sumar los valores numéricos, ignorando los que no son válidos
+                    suma_total = 0.0
+                    valores_limpios = []
+                    for v in valores:
+                        # Eliminar cualquier texto que no sea número (como "52.")
+                        if re.match(r'^\d+\.\d+$', v):  # Asegura formato decimal
+                            try:
+                                suma_total += float(v)
+                                valores_limpios.append(v)
+                            except ValueError:
+                                pass
 
-                    for factura, valor in zip(facturas, valores):
-                        valor_num = float(valor.replace(",", "").strip())
-                        resultados[factura]["total"] += valor_num
-                        resultados[factura]["formulario"] = formulario.group(1) if formulario else None
-                        resultados[factura]["codigo_barras"] = codigo_barras.group(0) if codigo_barras else None
+                    resultados.append({
+                        "Archivo": file,
+                        "Factura": factura,
+                        "Valor Total Sumado": suma_total,
+                        "Número Formulario": formulario if formulario else "",
+                        "Valores Encontrados": ", ".join(valores_limpios)  # Solo valores válidos
+                    })
 
-    # Convertir resultados a DataFrame
-    data = [
-        {
-            "Factura": factura,
-            "Valor Total": info["total"],
-            "Número Formulario": info["formulario"],
-            "Código Barras": info["codigo_barras"]
-        }
-        for factura, info in resultados.items()
-    ]
-    df = pd.DataFrame(data)
+                    print(f"✅ {file}: Factura={factura}, Suma={suma_total}, Formulario={formulario}")
+                    print(f"   Valores encontrados: {valores_limpios}")
 
-    # Exportar a Excel
+                except Exception as e:
+                    print(f"❌ Error en {file}: {e}")
+
+    # Crear DataFrame y guardar
+    df = pd.DataFrame(resultados)
+    # Opcional: eliminar columna de depuración si no la quieres en el Excel
+    # df.drop(columns=["Valores Encontrados"], inplace=True)
     df.to_excel(salida, index=False)
-    print(f"✅ Archivo Excel generado: {salida}")
+    print(f"\n📁 Archivo Excel generado: {salida}")
 
-# Ejecutar
 if __name__ == "__main__":
     procesar_pdfs()
