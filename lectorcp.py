@@ -2,44 +2,38 @@ import os
 import re
 import pdfplumber
 import pandas as pd
+from collections import defaultdict
 
 def extraer_datos_pdf(pdf_path, debug=False):
     """
     Extrae del PDF:
-        - Número de factura (patrón CM- seguido de dígitos)
-        - Lista de valores del campo 52 (valor total de cada ítem)
-        - Número de formulario (prioriza 0006..., luego 14 dígitos)
+        - Número de CP (formulario)
+        - Lista de facturas (CM-xxxxx, 190-xxxxx)
+        - Valores del campo 52 (valor total)
     """
-    factura = None
+    facturas = []
     valores_52 = []
     formulario = None
     texto_completo = ""
 
     with pdfplumber.open(pdf_path) as pdf:
-        for page_num, page in enumerate(pdf.pages):
-            texto = page.extract_text()
-            if texto:
-                texto_completo += texto + "\n"
-
-            # Extraer palabras especificas
+        for page in pdf.pages:
+            texto = page.extract_text() or ""
+            texto_completo += texto + "\n"
             words = page.extract_words()
 
-            # Buscar casillas "52." en esta página
+            # Buscar el total de cada fv
             etiquetas_52 = [w for w in words if "52." in w["text"]]
-
-            # buscar el número de abajo de cada etiqueta
             for etq in etiquetas_52:
                 for cand in words:
-                    # Misma columna debajo de la etiqueta
                     if (cand["top"] > etq["top"] and
                         abs(cand["x0"] - etq["x0"]) < 15 and
                         re.match(r'^[\d.]+$', cand["text"])):
-                        # no suma el 52.
                         if cand["text"] != "52.":
                             valores_52.append(cand["text"])
-                        break  
+                        break
 
-            # Buscar el numero de codigo de barras (aún no me funciona)
+            # númeor CP (me está trayendo la resolución)
             for w in words:
                 if re.match(r'^0006\d+', w["text"]):
                     formulario = w["text"]
@@ -47,72 +41,65 @@ def extraer_datos_pdf(pdf_path, debug=False):
                 elif re.match(r'^\d{14}$', w["text"]) and not formulario:
                     formulario = w["text"]
 
-        # Si no se encontraron valores por palabras especificas, intentar con regex
+        # Si no encontró valores con palabras, usar regex
         if not valores_52:
-            # Patrón más flexible: "52. Valor total" seguido de un número con decimales
             patron = r'52\.\s*Valor\s*total.*?(\d+\.\d+)'
             valores_52 = re.findall(patron, texto_completo, re.IGNORECASE | re.DOTALL)
 
-        # Buscar la palabra factura en todo el PDF
-        match_factura = re.search(r'CM-\d+', texto_completo)
-        if match_factura:
-            factura = match_factura.group(0)
+        # Buscar solo facturas válidas (CM-xxxxx o 190-xxxxx)
+        facturas = re.findall(r'(?:CM-\d+|190-\d+)', texto_completo)
 
-    if not factura:
-        factura = os.path.splitext(os.path.basename(pdf_path))[0]
+    # Convertir valores a float, para que no se quiebbbre
+    valores_limpios = []
+    for v in valores_52:
+        if re.match(r'^\d+\.\d+$', v):
+            try:
+                valores_limpios.append(float(v))
+            except ValueError:
+                pass
 
-    # Depurar
     if debug:
-        print("\n--- TEXTO EXTRAÍDO (primeros 2000 caracteres) ---")
-        print(texto_completo[:2000])
-        print("----------------------")
+        print(f"📄 {os.path.basename(pdf_path)}")
+        print(f"   CP: {formulario}")
+        print(f"   Facturas: {facturas}")
+        print(f"   Valores: {valores_limpios}")
 
-    return factura, valores_52, formulario
+    return facturas, valores_limpios, formulario
 
-def procesar_pdfs(base_dir="C:/Users/LENOVO/OneDrive/Desktop/CP",
-                  salida="C:/Users/LENOVO/OneDrive/Desktop/CP/resultado.xlsx",
-                  debug=True):
-    resultados = []
+def procesar_pdfs(base_dir, salida, debug=True):
+    filas = []
 
     for root, dirs, files in os.walk(base_dir):
         for file in files:
             if file.lower().endswith(".pdf"):
                 pdf_path = os.path.join(root, file)
                 try:
-                    factura, valores, formulario = extraer_datos_pdf(pdf_path, debug=debug)
+                    facturas, valores, formulario = extraer_datos_pdf(pdf_path, debug=debug)
 
-                    # Sumar los valores numéricos, menos el 52.
-                    suma_total = 0.0
-                    valores_limpios = []
-                    for v in valores:
-                        # Eliminar cualquier texto que no sea número (52.)
-                        if re.match(r'^\d+\.\d+$', v):  # Asegura formato decimal
-                            try:
-                                suma_total += float(v)
-                                valores_limpios.append(v)
-                            except ValueError:
-                                pass
+                    # Agrupar valores por factura
+                    agrupados = defaultdict(float)
+                    for i in range(min(len(facturas), len(valores))):
+                        agrupados[facturas[i]] += valores[i]
 
-                    resultados.append({
-                        "Archivo": file,
-                        "Factura": factura,
-                        "Valor Total Sumado": suma_total,
-                        "Número Formulario": formulario if formulario else "",
-                        "Valores Encontrados": ", ".join(valores_limpios)  # Solo valores válidos
-                    })
-
-                    print(f"✅ {file}: Factura={factura}, Suma={suma_total}, Formulario={formulario}")
-                    print(f"   Valores encontrados: {valores_limpios}")
+                    # Crear filas únicas por factura
+                    for factura, total in agrupados.items():
+                        filas.append({
+                            "Archivo": file,
+                            "Número Formulario (CP)": formulario if formulario else "",
+                            "Factura": factura,
+                            "Valor Total": total
+                        })
 
                 except Exception as e:
-                    print(f"❌ Error en {file}: {e}")
+                    print(f"x Error en {file}: {e}")
 
-    # Crear Datos y guardar
-    df = pd.DataFrame(resultados)
-    # quitar la columna de resultados en el excel, no es necesaria, solo la tengo para ver los resultados en el script
-    df.drop(columns=["Valores Encontrados"], inplace=True)
+    df = pd.DataFrame(filas)
     df.to_excel(salida, index=False)
-    print(f"\n📁 Archivo Excel generado: {salida}")
+    print(f"\n Archivo Excel generado: {salida}")
 
 if __name__ == "__main__":
-    procesar_pdfs()
+    procesar_pdfs(
+        base_dir="C:/Users/LENOVO/OneDrive/Desktop/CP",
+        salida="C:/Users/LENOVO/OneDrive/Desktop/CP/resultado.xlsx",
+        debug=True
+    )
